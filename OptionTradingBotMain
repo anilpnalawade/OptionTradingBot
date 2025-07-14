@@ -1,0 +1,181 @@
+import os
+import time
+import datetime
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from kiteconnect import KiteConnect
+import schedule
+
+# Zerodha API setup
+API_KEY = os.getenv("Z_API_KEY")
+API_SECRET = os.getenv("Z_API_SECRET")
+ACCESS_TOKEN = os.getenv("Z_ACCESS_TOKEN")
+
+kite = KiteConnect(api_key=API_KEY)
+kite.set_access_token(ACCESS_TOKEN)
+
+# Config
+TARGET_PROFIT_PERCENT = 1.0
+STOPLOSS_PERCENT = 1.0
+CAPITAL = 10000  # Your capital
+INSTRUMENT = "NIFTY"  # Can be "BANKNIFTY"
+
+# ---------------------- RSI Calculation -----------------------
+def calculate_rsi(symbol="^NSEI", period=14):
+    data = yf.download(symbol, period="15d", interval="5m")
+    if data.empty:
+        print("Failed to fetch data for RSI.")
+        return None
+    close = data['Close']
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+
+# ---------------------- Supertrend Filter -----------------------
+def calculate_supertrend(symbol="^NSEI", period=10, multiplier=3):
+    data = yf.download(symbol, period="15d", interval="5m")
+    if data.empty:
+        print("Failed to fetch data for Supertrend.")
+        return None
+
+    hl2 = (data['High'] + data['Low']) / 2
+    atr = data['High'].rolling(period).max() - data['Low'].rolling(period).min()
+    atr = atr.rolling(period).mean()
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
+
+    final_upperband = upperband.copy()
+    final_lowerband = lowerband.copy()
+    supertrend = [True] * len(data)
+
+    for i in range(1, len(data)):
+        if data['Close'][i - 1] > final_upperband[i - 1]:
+            supertrend[i] = True
+        elif data['Close'][i - 1] < final_lowerband[i - 1]:
+            supertrend[i] = False
+        else:
+            supertrend[i] = supertrend[i - 1]
+            if supertrend[i] and lowerband[i] > final_lowerband[i - 1]:
+                final_lowerband[i] = lowerband[i]
+            if not supertrend[i] and upperband[i] < final_upperband[i - 1]:
+                final_upperband[i] = upperband[i]
+
+    return supertrend[-1]  # True if bullish, False if bearish
+
+# ---------------------- Option Chain Selection -----------------------
+def get_option_chain(symbol="NIFTY"):
+    instruments = pd.DataFrame(kite.instruments("NFO"))
+    spot_price = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["last_price"]
+    atm_strike = round(spot_price / 50) * 50
+    ce_symbol = get_option_symbol(symbol, atm_strike, 'CE')
+    pe_symbol = get_option_symbol(symbol, atm_strike, 'PE')
+    return ce_symbol, pe_symbol, spot_price
+
+def get_option_symbol(symbol, strike, option_type):
+    expiry = get_nearest_expiry()
+    return f"{symbol}{expiry}{strike}{option_type}"
+
+def get_nearest_expiry():
+    today = datetime.date.today()
+    weekday = today.weekday()
+    days_until_thursday = (3 - weekday) % 7
+    expiry_date = today + datetime.timedelta(days=days_until_thursday)
+    return expiry_date.strftime("%d%b").upper()
+
+# ---------------------- Trade Execution -----------------------
+def place_trade(option_symbol, transaction_type):
+    try:
+        ltp = kite.ltp(f"NFO:{option_symbol}")[f"NFO:{option_symbol}"]["last_price"]
+        quantity = int(CAPITAL / ltp)
+        if quantity == 0:
+            print("Insufficient capital for 1 lot.")
+            return None, 0, 0
+        kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NFO,
+            tradingsymbol=option_symbol,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS
+        )
+        print(f"{transaction_type} order placed for {option_symbol} at {ltp}")
+        return option_symbol, ltp, quantity
+    except Exception as e:
+        print("Trade Error:", e)
+        return None, 0, 0
+
+def square_off(symbol, quantity):
+    try:
+        kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NFO,
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_SELL,
+            quantity=quantity,
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS
+        )
+        print(f"Position squared off: {symbol}")
+    except Exception as e:
+        print("Square Off Error:", e)
+
+# ---------------------- Strategy Logic -----------------------
+def strategy():
+    ce_symbol, pe_symbol, spot = get_option_chain(INSTRUMENT)
+    rsi_value = calculate_rsi("^NSEI" if INSTRUMENT == "NIFTY" else "^NSEBANK")
+    supertrend_signal = calculate_supertrend("^NSEI" if INSTRUMENT == "NIFTY" else "^NSEBANK")
+    print(f"Current RSI: {rsi_value:.2f} | Supertrend: {'Bullish' if supertrend_signal else 'Bearish'}")
+
+    if rsi_value is None or supertrend_signal is None:
+        print("Indicators not available. Skipping trade.")
+        return
+
+    if rsi_value < 30 and supertrend_signal:
+        side = "CE"
+    elif rsi_value > 70 and not supertrend_signal:
+        side = "PE"
+    else:
+        print("RSI and Supertrend not aligned – No trade today.")
+        return
+
+    chosen_symbol = ce_symbol if side == "CE" else pe_symbol
+    print(f"Signal: Buy {side} => {chosen_symbol}")
+
+    symbol, entry_price, qty = place_trade(chosen_symbol, kite.TRANSACTION_TYPE_BUY)
+    if not symbol:
+        return
+
+    target_price = entry_price * (1 + TARGET_PROFIT_PERCENT / 100)
+    stoploss_price = entry_price * (1 - STOPLOSS_PERCENT / 100)
+
+    while True:
+        time.sleep(30)
+        try:
+            ltp = kite.ltp(f"NFO:{symbol}")[f"NFO:{symbol}"]["last_price"]
+            print(f"{symbol} LTP: {ltp:.2f} | Target: {target_price:.2f} | SL: {stoploss_price:.2f}")
+            if ltp >= target_price or ltp <= stoploss_price:
+                square_off(symbol, qty)
+                break
+        except Exception as e:
+            print("LTP tracking error:", e)
+
+# ---------------------- Scheduler -----------------------
+def main():
+    now = datetime.datetime.now()
+    if now.weekday() >= 5 or now.hour < 9 or now.hour >= 15:
+        print("Market closed or off day.")
+        return
+    strategy()
+
+schedule.every().day.at("09:30").do(main)
+
+print("Bot is running...")
+
+while True:
+    schedule.run_pending()
+    time.sleep(10)
